@@ -1,0 +1,31 @@
+# PDF Redaction Configuration
+# Exceptions to the default behavior (case-insensitive substring matching)
+
+# Redaction settings
+redaction:
+  # Default behavior: "none" or "all"
+  # - "none": Redact nothing by default, exceptions list specifies what TO redact
+  # - "all": Redact everything by default, exceptions list specifies what to KEEP
+  default: "none"
+
+  # Color as RGB values (0.0 to 1.0) or hex string
+  # Examples: [0, 0, 0] for black, [1, 1, 1] for white, "#FF0000" for red
+  color: "#808080"
+
+  # Also redact the exchange rate line below matching transactions
+  include_exchange_rate: true
+
+# Exceptions to the default behavior
+# When default is "none": these terms trigger redaction
+# When default is "all": these terms are kept visible (not redacted)
+exceptions:
+  # Add terms to match (case-insensitive substring matching)
+  # Examples:
+  - "EXAMPLE_VENDOR"
+  - "SAMPLE_MERCHANT"
+  # - "YOUR_TERM_HERE"
+
+# Exact match exceptions (for short terms that could cause false positives)
+# These match the description field exactly (case-insensitive)
+exact_match:
+  # - "XX"  # Use for short terms that might match unintended text
