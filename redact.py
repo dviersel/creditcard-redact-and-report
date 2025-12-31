@@ -21,6 +21,9 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 import yaml
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
 
 
 # Dutch month abbreviations used in ICS bills
@@ -136,7 +139,7 @@ def is_transaction_row(spans: list[dict]) -> bool:
 def parse_transaction_row(spans: list[dict]) -> dict | None:
     """
     Parse a transaction row and extract column information.
-    Returns dict with description, city, their bounding boxes, and column boundaries.
+    Returns dict with dates, description, city, country, amounts, bounding boxes, and column boundaries.
     """
     if len(spans) < 5:
         return None
@@ -177,6 +180,7 @@ def parse_transaction_row(spans: list[dict]) -> dict | None:
     desc_spans = spans[desc_start_idx:city_idx]
     city_span = spans[city_idx]
     country_span = spans[country_idx]
+    date1_span = spans[date_cols[0]]
     date2_span = spans[date_cols[1]]
 
     if not desc_spans:
@@ -185,6 +189,15 @@ def parse_transaction_row(spans: list[dict]) -> dict | None:
     # Combine description text
     description = " ".join(s["text"] for s in desc_spans)
     city = city_span["text"]
+    country = country_span["text"]
+
+    # Extract dates
+    date1 = date1_span["text"]
+    date2 = date2_span["text"]
+
+    # Extract amounts (everything after country code)
+    amount_spans = spans[country_idx + 1:]
+    amounts = [s["text"] for s in amount_spans]
 
     # Calculate bounding boxes for description and city columns
     desc_bbox = fitz.Rect(desc_spans[0]["bbox"])
@@ -209,8 +222,12 @@ def parse_transaction_row(spans: list[dict]) -> dict | None:
     city_cell_x1 = country_span["bbox"].x0 - 2
 
     return {
+        "date1": date1,
+        "date2": date2,
         "description": description,
         "city": city,
+        "country": country,
+        "amounts": amounts,
         "desc_bbox": desc_bbox,
         "city_bbox": city_bbox,
         "desc_spans": desc_spans,
@@ -343,6 +360,45 @@ def get_exchange_rate_redact_rect(spans: list[dict], desc_cell_x0: float, city_c
     return fitz.Rect(desc_cell_x0, row_y0 - 1, city_cell_x1, row_y1 + 1)
 
 
+def parse_exchange_rate_row(spans: list[dict]) -> dict | None:
+    """Parse exchange rate row and extract rate info."""
+    if not spans:
+        return None
+
+    # Combine all text to parse
+    full_text = " ".join(s["text"] for s in spans)
+
+    # Try different patterns for exchange rate lines
+    # Pattern 1: "1,01437 Wisselkoers USD" (rate before text)
+    match = re.search(r"([\d,\.]+)\s+Wisselkoers\s+([A-Z]{3})", full_text)
+    if match:
+        return {
+            "rate": match.group(1),
+            "currency": match.group(2),
+            "full_text": full_text
+        }
+
+    # Pattern 2: "Wisselkoers USD 1,0482" (rate after currency)
+    match = re.search(r"Wisselkoers\s+([A-Z]{3})\s+([\d,\.]+)", full_text)
+    if match:
+        return {
+            "currency": match.group(1),
+            "rate": match.group(2),
+            "full_text": full_text
+        }
+
+    # Pattern 3: "Wisselkoers USD 1 EUR = 1,0482 USD"
+    match = re.search(r"Wisselkoers\s+([A-Z]{3}).*?=\s*([\d,\.]+)", full_text)
+    if match:
+        return {
+            "currency": match.group(1),
+            "rate": match.group(2),
+            "full_text": full_text
+        }
+
+    return {"full_text": full_text}
+
+
 def redact_pdf(
     input_path: Path,
     output_path: Path,
@@ -362,8 +418,10 @@ def redact_pdf(
         "pages": len(doc),
         "transactions_found": 0,
         "transactions_redacted": 0,
+        "transactions_kept": 0,
         "exchange_rates_redacted": 0,
-        "redacted_items": []
+        "redacted_items": [],
+        "kept_items": []
     }
 
     for page_num, page in enumerate(doc):
@@ -371,8 +429,9 @@ def redact_pdf(
         rows = group_spans_by_row(spans)
         row_keys = list(rows.keys())
 
-        # Track which row indices have been redacted (for exchange rate detection)
+        # Track which row indices have been redacted/kept (for exchange rate detection)
         redacted_row_info = {}  # y -> parsed info
+        kept_row_info = {}  # y -> (parsed info, idx in kept_items)
 
         for idx, y in enumerate(row_keys):
             row_spans = rows[y]
@@ -406,38 +465,62 @@ def redact_pdf(
 
                     page.add_redact_annot(desc_rect, fill=fill_color)
                     page.add_redact_annot(city_rect, fill=fill_color)
+            else:
+                # Track kept (non-redacted) transactions for report
+                stats["transactions_kept"] += 1
+                kept_item = {
+                    "page": page_num + 1,
+                    "source_file": input_path.name,
+                    "date1": parsed["date1"],
+                    "date2": parsed["date2"],
+                    "description": parsed["description"],
+                    "city": parsed["city"],
+                    "country": parsed["country"],
+                    "amounts": parsed["amounts"],
+                    "exchange_rate": None
+                }
+                kept_row_info[y] = (parsed, len(stats["kept_items"]))
+                stats["kept_items"].append(kept_item)
 
-        # Second pass: find and redact exchange rate lines following redacted transactions
-        if include_exchange_rate:
-            for idx, y in enumerate(row_keys):
-                row_spans = rows[y]
+        # Second pass: find exchange rate lines
+        for idx, y in enumerate(row_keys):
+            row_spans = rows[y]
 
-                if not is_exchange_rate_row(row_spans):
-                    continue
+            if not is_exchange_rate_row(row_spans):
+                continue
 
-                # Check if previous row was a redacted transaction
-                if idx > 0:
-                    prev_y = row_keys[idx - 1]
-                    if prev_y in redacted_row_info:
-                        parsed = redacted_row_info[prev_y]
-                        stats["exchange_rates_redacted"] += 1
+            # Check if previous row was a transaction
+            if idx > 0:
+                prev_y = row_keys[idx - 1]
 
-                        # Mark that this redacted item has an exchange rate
-                        for item in stats["redacted_items"]:
-                            if (item["description"] == parsed["description"] and
-                                item["city"] == parsed["city"]):
-                                item["has_exchange_rate"] = True
-                                break
+                # Handle redacted transactions
+                if prev_y in redacted_row_info and include_exchange_rate:
+                    parsed = redacted_row_info[prev_y]
+                    stats["exchange_rates_redacted"] += 1
 
-                        if not dry_run:
-                            # Get the exchange rate redaction rect using the same column boundaries
-                            exch_rect = get_exchange_rate_redact_rect(
-                                row_spans,
-                                parsed["desc_cell"].x0,
-                                parsed["city_cell"].x1
-                            )
-                            if exch_rect:
-                                page.add_redact_annot(exch_rect, fill=fill_color)
+                    # Mark that this redacted item has an exchange rate
+                    for item in stats["redacted_items"]:
+                        if (item["description"] == parsed["description"] and
+                            item["city"] == parsed["city"]):
+                            item["has_exchange_rate"] = True
+                            break
+
+                    if not dry_run:
+                        # Get the exchange rate redaction rect using the same column boundaries
+                        exch_rect = get_exchange_rate_redact_rect(
+                            row_spans,
+                            parsed["desc_cell"].x0,
+                            parsed["city_cell"].x1
+                        )
+                        if exch_rect:
+                            page.add_redact_annot(exch_rect, fill=fill_color)
+
+                # Handle kept transactions - capture exchange rate info
+                elif prev_y in kept_row_info:
+                    _, kept_idx = kept_row_info[prev_y]
+                    exch_info = parse_exchange_rate_row(row_spans)
+                    if exch_info:
+                        stats["kept_items"][kept_idx]["exchange_rate"] = exch_info
 
         if not dry_run:
             # Apply all redactions on this page (removes underlying text)
@@ -455,6 +538,129 @@ def redact_pdf(
         stats["verification"] = verification
 
     return stats
+
+
+def create_excel_report(kept_items: list[dict], output_path: Path) -> None:
+    """Create Excel report with non-redacted transactions."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Transactions"
+
+    # Define styles
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin_border = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin")
+    )
+
+    # Headers
+    headers = [
+        "Source File",
+        "Date",
+        "Description",
+        "City",
+        "Country",
+        "Foreign Amount",
+        "EUR Amount",
+        "Exchange Rate",
+        "Currency"
+    ]
+
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_alignment
+        cell.border = thin_border
+
+    def parse_euro_number(s: str) -> float | None:
+        """Convert European number format (comma as decimal) to float."""
+        if not s:
+            return None
+        try:
+            # Remove spaces, replace comma with period
+            cleaned = s.strip().replace(" ", "").replace(".", "").replace(",", ".")
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    # Data rows
+    for row_idx, item in enumerate(kept_items, 2):
+        amounts = item.get("amounts", [])
+
+        # Parse amounts intelligently
+        # Possible formats:
+        # EUR only: ['38,70', 'Af'] or ['38,70', 'Bij']
+        # Foreign: ['36,00', 'USD', '35,49', 'Af'] - foreign, currency, EUR, direction
+        # Or: ['36,00', '35,49', 'Af', 'USD'] - depends on PDF structure
+
+        foreign_amount = None
+        eur_amount = None
+        currency = ""
+
+        # Find currency code (3 uppercase letters)
+        currency_idx = None
+        for i, val in enumerate(amounts):
+            if re.match(r'^[A-Z]{3}$', val):
+                currency = val
+                currency_idx = i
+                break
+
+        # Find numeric amounts (contain digits and comma/period)
+        numeric_amounts = []
+        for i, val in enumerate(amounts):
+            if re.match(r'^[\d\s,\.]+$', val.strip()):
+                numeric_amounts.append((i, val.strip()))
+
+        if currency and len(numeric_amounts) >= 2:
+            # Foreign currency transaction - first numeric is foreign, second is EUR
+            foreign_amount = parse_euro_number(numeric_amounts[0][1])
+            eur_amount = parse_euro_number(numeric_amounts[1][1])
+        elif len(numeric_amounts) >= 1:
+            # EUR only transaction
+            eur_amount = parse_euro_number(numeric_amounts[0][1])
+
+        # Exchange rate info (may override currency from amounts)
+        exch_rate = item.get("exchange_rate") or {}
+        rate_value = parse_euro_number(exch_rate.get("rate", ""))
+        if exch_rate.get("currency"):
+            currency = exch_rate.get("currency", currency)
+
+        row_data = [
+            item.get("source_file", ""),
+            item.get("date1", ""),
+            item.get("description", ""),
+            item.get("city", ""),
+            item.get("country", ""),
+            foreign_amount,
+            eur_amount,
+            rate_value,
+            currency
+        ]
+
+        for col, value in enumerate(row_data, 1):
+            cell = ws.cell(row=row_idx, column=col, value=value)
+            cell.border = thin_border
+
+    # Auto-adjust column widths
+    for col in range(1, len(headers) + 1):
+        max_length = 0
+        column_letter = get_column_letter(col)
+        for row in range(1, len(kept_items) + 2):
+            cell = ws.cell(row=row, column=col)
+            if cell.value:
+                max_length = max(max_length, len(str(cell.value)))
+        adjusted_width = min(max_length + 2, 50)
+        ws.column_dimensions[column_letter].width = adjusted_width
+
+    # Freeze header row
+    ws.freeze_panes = "A2"
+
+    wb.save(output_path)
 
 
 def main():
@@ -499,6 +705,11 @@ def main():
         action="store_true",
         help="Show detailed output"
     )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help="Generate Excel report of non-redacted transactions to specified path"
+    )
 
     args = parser.parse_args()
 
@@ -517,6 +728,9 @@ def main():
     # Create output directory if specified
     if args.output:
         args.output.mkdir(parents=True, exist_ok=True)
+
+    # Collect all kept items for report
+    all_kept_items = []
 
     # Process each input file
     for input_path in args.input_files:
@@ -558,6 +772,9 @@ def main():
                     print(f"    [Page {item['page']}] {item['description'][:40]}... | "
                           f"{item['city']} (matched: {item['matched_term']}){exch_note}")
 
+            # Collect kept items for report
+            all_kept_items.extend(stats.get("kept_items", []))
+
             if not args.dry_run:
                 print(f"  Output: {output_path}")
 
@@ -579,6 +796,19 @@ def main():
                 import traceback
                 traceback.print_exc()
             continue
+
+    # Generate Excel report if requested
+    if args.report and all_kept_items:
+        try:
+            create_excel_report(all_kept_items, args.report)
+            print(f"\nReport: {args.report} ({len(all_kept_items)} transactions)")
+        except Exception as e:
+            print(f"\nError creating report: {e}")
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
+    elif args.report and not all_kept_items:
+        print("\nNo transactions to report (all were redacted)")
 
     print("\nDone.")
 
